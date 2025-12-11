@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Алгоритмы отсечения</title>
+<style>
+  body { font-family: Arial, sans-serif; margin: 12px; color: #111; }
+  h1 { margin: 0 0 8px 0; font-size: 20px; }
+  #container { display:flex; gap:12px; align-items:flex-start; }
+  #left { width: 480px; }
+  textarea { width:100%; height:220px; font-family: monospace; font-size:13px; }
+  .btn { margin-top:8px; padding:8px 10px; border-radius:4px; border:1px solid #888; background:#f3f3f3; cursor:pointer; }
+  .btn:hover { background:#e9e9e9; }
+  #canvasWrap { border:1px solid #ccc; padding:6px; background:#fff; }
+  canvas { background:#ffffff; display:block; }
+  label { font-weight:600; }
+  .row { margin-top:6px; }
+  .legend { margin-top:10px; font-size:13px; }
+  .dot { display:inline-block; width:12px; height:12px; margin-right:6px; vertical-align:middle; }
+</style>
+</head>
+<body>
+<h1>Алгоритмы отсечения</h1>
+<div id="container">
+  <div id="left">
+    <label>Входные данные:</label>
+    <textarea id="inputArea"></textarea>
+    <div class="row">
+      <button class="btn" id="loadSample">Загрузить пример</button>
+      <button class="btn" id="draw">Показать исходные</button>
+      <button class="btn" id="clip">Выполнить отсечение</button>
+      <button class="btn" id="clear">Очистить</button>
+    </div>
+    <div class="row">
+      <label>Дополнительно (ввод выпуклого полигона для отсечения):</label>
+      <textarea id="clipPolyArea" placeholder="Напр.: 4
+-10 -10
+10 -10
+10 10
+-10 10
+(Если оставить пустым — используется прямоугольное окно из входа)"></textarea>
+    </div>
+
+    <div class="legend">
+      <div><span class="dot" style="background:#2d6cdf"></span>Отсечающее окно / отсечный полиго́н</div>
+      <div><span class="dot" style="background:#888"></span>Исходные отрезки / оригинальный многоугольник</div>
+      <div><span class="dot" style="background:#e22"></span>Видимые части отрезков после отсечения</div>
+      <div><span class="dot" style="background:#0a0"></span>Отсечённый многоугольник (результат Sutherland–Hodgman)</div>
+    </div>
+  </div>
+
+  <div id="right">
+    <div id="canvasWrap">
+      <canvas id="c" width="800" height="600"></canvas>
+    </div>
+  </div>
+</div>
+
+<script>
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+const inputArea = document.getElementById('inputArea');
+const clipPolyArea = document.getElementById('clipPolyArea');
+
+document.getElementById('loadSample').onclick = loadSample;
+document.getElementById('draw').onclick = drawFromInput;
+document.getElementById('clear').onclick = () => { ctx.clearRect(0,0,canvas.width,canvas.height); };
+document.getElementById('clip').onclick = doClipping;
+
+function loadSample(){
+  inputArea.value = `6
+-120 -80 -40 120
+-60 -120 120 60
+-130 40 130 40
+-50 50 50 -50
+-160 -160 -80 -80
+80 -30 200 30
+-100 -80 100 80`;
+  clipPolyArea.value = `4
+-100 -80
+100 -80
+100 80
+-100 80`;
+  drawFromInput();
+}
+
+const world = { xmin: -200, xmax: 200, ymin: -150, ymax: 150 };
+
+function worldToCanvas(x,y){
+  const w = canvas.width, h = canvas.height;
+  const sx = w / (world.xmax - world.xmin);
+  const sy = h / (world.ymax - world.ymin);
+  const px = (x - world.xmin) * sx;
+  const py = h - (y - world.ymin) * sy;
+  return [px, py];
+}
+
+function drawAxes(){
+  ctx.save();
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = '#ccc';
+  for(let x = Math.ceil(world.xmin/20)*20; x <= world.xmax; x+=20){
+    const [px1,py1] = worldToCanvas(x, world.ymin);
+    const [px2,py2] = worldToCanvas(x, world.ymax);
+    ctx.beginPath(); ctx.moveTo(px1,py1); ctx.lineTo(px2,py2); ctx.stroke();
+  }
+  for(let y = Math.ceil(world.ymin/20)*20; y <= world.ymax; y+=20){
+    const [px1,py1] = worldToCanvas(world.xmin, y);
+    const [px2,py2] = worldToCanvas(world.xmax, y);
+    ctx.beginPath(); ctx.moveTo(px1,py1); ctx.lineTo(px2,py2); ctx.stroke();
+  }
+  ctx.strokeStyle = '#444'; ctx.lineWidth = 1.5;
+  const [ax1,ay1] = worldToCanvas(world.xmin,0);
+  const [ax2,ay2] = worldToCanvas(world.xmax,0);
+  ctx.beginPath(); ctx.moveTo(ax1,ay1); ctx.lineTo(ax2,ay2); ctx.stroke();
+  const [bx1,by1] = worldToCanvas(0, world.ymin);
+  const [bx2,by2] = worldToCanvas(0, world.ymax);
+  ctx.beginPath(); ctx.moveTo(bx1,by1); ctx.lineTo(bx2,by2); ctx.stroke();
+  ctx.restore();
+}
+
+function parseInput(text){
+  const toks = text.trim().split(/\s+/).map(Number).filter(n=>!Number.isNaN(n));
+  if(toks.length === 0) throw new Error('Пустой ввод');
+  let idx = 0;
+  const n = toks[idx++]; if(!Number.isFinite(n) || n < 0) throw new Error('Неверный n');
+  const segments = [];
+  for(let i=0;i<n;i++){
+    if(idx+3 >= toks.length) throw new Error('Недостаточно координат для отрезков');
+    const x1 = toks[idx++], y1 = toks[idx++], x2 = toks[idx++], y2 = toks[idx++];
+    segments.push({x1,y1,x2,y2});
+  }
+  if(idx+3 >= toks.length) throw new Error('Нет координат окна (Xmin Ymin Xmax Ymax)');
+  const Xmin = toks[idx++], Ymin = toks[idx++], Xmax = toks[idx++], Ymax = toks[idx++];
+  const rect = {xmin: Math.min(Xmin,Xmax), ymin: Math.min(Ymin,Ymax), xmax: Math.max(Xmin,Xmax), ymax: Math.max(Ymin,Ymax)};
+  return {segments, rect};
+}
+
+function drawRect(rect, color='#2d6cdf', lineWidth=2){
+  ctx.save();
+  ctx.strokeStyle = color; ctx.lineWidth = lineWidth;
+  const [x1,y1] = worldToCanvas(rect.xmin, rect.ymin);
+  const [x2,y2] = worldToCanvas(rect.xmax, rect.ymax);
+  const w = x2 - x1, h = y1 - y2;
+  ctx.strokeRect(x1, y2, w, h);
+  ctx.restore();
+}
+
+function drawSegment(s, color='#888', lw=2, dashed=false){
+  ctx.save();
+  ctx.strokeStyle = color; ctx.lineWidth = lw;
+  if(dashed){ ctx.setLineDash([6,4]); }
+  const [x1,y1] = worldToCanvas(s.x1, s.y1);
+  const [x2,y2] = worldToCanvas(s.x2, s.y2);
+  ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+  ctx.restore();
+}
+
+function drawPolygon(points, color='#888', fill=false, fillAlpha=0.12, lw=2){
+  if(points.length === 0) return;
+  ctx.save();
+  ctx.lineWidth = lw;
+  ctx.strokeStyle = color;
+  if(fill){
+    ctx.fillStyle = hexToRgba(color, fillAlpha);
+  }
+  ctx.beginPath();
+  const [x0,y0] = worldToCanvas(points[0].x, points[0].y);
+  ctx.moveTo(x0,y0);
+  for(let i=1;i<points.length;i++){
+    const [x,y] = worldToCanvas(points[i].x, points[i].y);
+    ctx.lineTo(x,y);
+  }
+  ctx.closePath();
+  if(fill) ctx.fill();
+  ctx.stroke();
+  ctx.restore();
+}
+
+function hexToRgba(hex, a){
+  const tmp = document.createElement('div');
+  tmp.style.color = hex; document.body.appendChild(tmp);
+  const cs = getComputedStyle(tmp).color; document.body.removeChild(tmp);
+  const m = cs.match(/(\d+),\s*(\d+),\s*(\d+)/);
+  if(!m) return `rgba(0,0,0,${a})`;
+  return `rgba(${m[1]},${m[2]},${m[3]},${a})`;
+}
+
+const INSIDE = 0;
+const LEFT = 1;
+const RIGHT = 2;
+const BOTTOM = 4;
+const TOP = 8;
+
+function computeOutCode(x, y, rect){
+  let code = INSIDE;
+  if (x < rect.xmin) code |= LEFT;
+  else if (x > rect.xmax) code |= RIGHT;
+  if (y < rect.ymin) code |= BOTTOM;
+  else if (y > rect.ymax) code |= TOP;
+  return code;
+}
+
+function cohenSutherlandClip(seg, rect){
+  let x0 = seg.x1, y0 = seg.y1, x1 = seg.x2, y1 = seg.y2;
+  let outcode0 = computeOutCode(x0,y0,rect);
+  let outcode1 = computeOutCode(x1,y1,rect);
+  let accept = false;
+
+  while(true){
+    if(!(outcode0 | outcode1)){
+      accept = true; break;
+    } else if(outcode0 & outcode1){
+      break;
+    } else {
+      let outcodeOut = outcode0 ? outcode0 : outcode1;
+      let x, y;
+      if(outcodeOut & TOP){
+        x = x0 + (x1 - x0) * (rect.ymax - y0) / (y1 - y0);
+        y = rect.ymax;
+      } else if(outcodeOut & BOTTOM){
+        x = x0 + (x1 - x0) * (rect.ymin - y0) / (y1 - y0);
+        y = rect.ymin;
+      } else if(outcodeOut & RIGHT){
+        y = y0 + (y1 - y0) * (rect.xmax - x0) / (x1 - x0);
+        x = rect.xmax;
+      } else if(outcodeOut & LEFT){
+        y = y0 + (y1 - y0) * (rect.xmin - x0) / (x1 - x0);
+        x = rect.xmin;
+      }
+      if(outcodeOut === outcode0){
+        x0 = x; y0 = y; outcode0 = computeOutCode(x0,y0,rect);
+      } else {
+        x1 = x; y1 = y; outcode1 = computeOutCode(x1,y1,rect);
+      }
+    }
+  }
+
+  if(accept) return {x1:x0,y1:y0,x2:x1,y2:y1};
+  return null;
+}
+
+function sutherlandHodgman(subjectPolygon, clipPolygon){
+  let outputList = subjectPolygon.slice();
+  const lenClip = clipPolygon.length;
+  if(lenClip === 0) return [];
+  for(let i=0;i<lenClip;i++){
+    const A = clipPolygon[i];
+    const B = clipPolygon[(i+1)%lenClip];
+    const inputList = outputList.slice();
+    outputList = [];
+    if(inputList.length === 0) break;
+
+    for(let j=0;j<inputList.length;j++){
+      const P = inputList[j];
+      const Q = inputList[(j+1)%inputList.length];
+      const insideP = isInside(P, A, B);
+      const insideQ = isInside(Q, A, B);
+
+      if(insideP && insideQ){
+        outputList.push(Q);
+      } else if(insideP && !insideQ){
+        const I = computeIntersection(P, Q, A, B);
+        if(I) outputList.push(I);
+      } else if(!insideP && insideQ){
+        const I = computeIntersection(P, Q, A, B);
+        if(I) outputList.push(I);
+        outputList.push(Q);
+      } else {
+      }
+    }
+  }
+  return outputList;
+}
+
+function isInside(p, a, b){
+  const cross = (b.x - a.x)*(p.y - a.y) - (b.y - a.y)*(p.x - a.x);
+  return cross >= -1e-9;
+}
+
+function computeIntersection(p, q, a, b){
+  const A1 = q.y - p.y;
+  const B1 = p.x - q.x;
+  const C1 = A1*p.x + B1*p.y;
+  const A2 = b.y - a.y;
+  const B2 = a.x - b.x;
+  const C2 = A2*a.x + B2*a.y;
+  const det = A1*B2 - A2*B1;
+  if(Math.abs(det) < 1e-9) return null;
+  const x = (B2*C1 - B1*C2) / det;
+  const y = (A1*C2 - A2*C1) / det;
+  return {x,y};
+}
+
+function parsePolygonText(text){
+  const toks = text.trim().split(/\s+/).map(Number).filter(n=>!Number.isNaN(n));
+  if(toks.length === 0) return null;
+  let idx = 0;
+  const m = toks[idx++]; if(!Number.isFinite(m) || m < 3) throw new Error('Неверный размер полигона');
+  const pts = [];
+  for(let i=0;i<m;i++){
+    if(idx+1 >= toks.length) throw new Error('Недостаточно координат полигона');
+    pts.push({x: toks[idx++], y: toks[idx++]});
+  }
+  return pts;
+}
+
+let lastParsed = null;
+
+function drawFromInput(){
+  try{
+    const parsed = parseInput(inputArea.value || '');
+    lastParsed = parsed;
+    drawAxes();
+    adjustWorld(parsed);
+    drawAxes();
+    drawRect(parsed.rect, '#2d6cdf', 3);
+    parsed.segments.forEach(s => drawSegment(s, '#888', 2));
+    const clipPolyText = clipPolyArea.value.trim();
+    if(clipPolyText){
+      try{
+        const poly = parsePolygonText(clipPolyText);
+        drawPolygon(poly, '#888', true, 0.06, 2);
+      }catch(e){}
+    }
+  }catch(e){
+    alert('Ошибка парсинга входа: ' + e.message);
+  }
+}
+
+function adjustWorld(parsed){
+  let xmin = parsed.rect.xmin, xmax = parsed.rect.xmax, ymin = parsed.rect.ymin, ymax = parsed.rect.ymax;
+  parsed.segments.forEach(s => {
+    xmin = Math.min(xmin, s.x1, s.x2);
+    xmax = Math.max(xmax, s.x1, s.x2);
+    ymin = Math.min(ymin, s.y1, s.y2);
+    ymax = Math.max(ymax, s.y1, s.y2);
+  });
+  const cp = (clipPolyArea.value.trim() ? (()=>{ try{ return parsePolygonText(clipPolyArea.value.trim()); }catch(e){return null;} })() : null);
+  if(cp){
+    cp.forEach(p => { xmin = Math.min(xmin, p.x); xmax = Math.max(xmax, p.x); ymin = Math.min(ymin, p.y); ymax = Math.max(ymax, p.y); });
+  }
+  const dx = Math.max(10, (xmax - xmin) * 0.12);
+  const dy = Math.max(10, (ymax - ymin) * 0.12);
+  world.xmin = xmin - dx; world.xmax = xmax + dx;
+  world.ymin = ymin - dy; world.ymax = ymax + dy;
+}
+
+function doClipping(){
+  if(!lastParsed){
+    try{ lastParsed = parseInput(inputArea.value || ''); }catch(e){ alert('Ошибка: ' + e.message); return; }
+  }
+  drawAxes();
+  drawRect(lastParsed.rect, '#2d6cdf', 3);
+  lastParsed.segments.forEach(s => drawSegment(s, '#888', 2));
+  lastParsed.segments.forEach(s => {
+    const clipped = cohenSutherlandClip(s, lastParsed.rect);
+    if(clipped){
+      const seg = {x1:clipped.x1,y1:clipped.y1,x2:clipped.x2,y2:clipped.y2};
+      drawSegment(seg, '#e22', 3);
+    }
+  });
+
+  const subjectPolyText = clipPolyArea.value.trim();
+  if(subjectPolyText){
+    try{
+      const subj = parsePolygonText(subjectPolyText);
+      const clipPoly = [
+        {x: lastParsed.rect.xmin, y: lastParsed.rect.ymin},
+        {x: lastParsed.rect.xmax, y: lastParsed.rect.ymin},
+        {x: lastParsed.rect.xmax, y: lastParsed.rect.ymax},
+        {x: lastParsed.rect.xmin, y: lastParsed.rect.ymax}
+      ];
+      drawPolygon(subj, '#888', true, 0.06, 2);
+      const result = sutherlandHodgman(subj, clipPoly);
+      drawPolygon(clipPoly, '#2d6cdf', false, 0.02, 2);
+      if(result && result.length > 0){
+        drawPolygon(result, '#0a0', true, 0.14, 2);
+      } else {
+      }
+    }catch(e){
+      console.warn('Неправильный формат полигона: ' + e.message);
+    }
+  } else {
+  }
+
+  ctx.save();
+  ctx.fillStyle = '#000';
+  ctx.font = '12px Arial';
+  ctx.fillText('Красным — видимые части отрезков после Cohen–Sutherland', 10, canvas.height - 40);
+  ctx.fillText('Зелёным — результат отсекающего для полигона (Sutherland–Hodgman)', 10, canvas.height - 24);
+  ctx.restore();
+}
+
+loadSample();
+</script>
+</body>
+</html>
